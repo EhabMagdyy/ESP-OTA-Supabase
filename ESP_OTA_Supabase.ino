@@ -23,8 +23,8 @@
 #define PASSWORD              "PASSWORD"
 
 // Supabase credentials
-#define supabaseUrl           "https://ujfdlgrhqlxwbgaiisni.supabase.co"
-#define supabaseAPIKey        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVqZmRsZ3JocWx4d2JnYWlpc25pIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDEzMDAwMjUsImV4cCI6MjA1Njg3NjAyNX0.eMuxLYuzjhXlVZd-S8WLzE8kyOdK_dj1GKD5JT4keAM"
+#define supabaseUrl           "supabaseUrl"
+#define supabaseAPIKey        "supabaseAPIKey"
 #define tableName             "ota"
 
 // Current firmware version
