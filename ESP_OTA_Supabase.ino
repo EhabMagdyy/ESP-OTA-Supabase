@@ -23,9 +23,9 @@
 #define PASSWORD              "PASSWORD"
 
 // Supabase credentials
-#define supabaseUrl           "https://ujfdlgrhqlxwbgaiisni.supabase.co"
-#define supabaseAPIKey        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVqZmRsZ3JocWx4d2JnYWlpc25pIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDEzMDAwMjUsImV4cCI6MjA1Njg3NjAyNX0.eMuxLYuzjhXlVZd-S8WLzE8kyOdK_dj1GKD5JT4keAM"
-#define tableName             "ota"
+#define supabaseUrl           "supabaseUrl"
+#define supabaseAPIKey        "supabaseAPIKey"
+#define tableName             "tableName"
 
 // Current firmware version
 const String CURRENT_FIRMWARE_VERSION = "1.0";
@@ -196,65 +196,159 @@ void ESP32UpdateFirwmare(String updateFileUrl)
 #ifdef ESP8266
 void ESP8266UpdateFirwmare(String updateFileUrl)
 {
-  HTTPClient http;
-  WiFiClientSecure client;
-  client.setInsecure();
-  http.begin(client, updateFileUrl);
-  http.addHeader("Authorization", "Bearer " + String(supabaseAPIKey));
+    const size_t chunkSize = 16384; // 16KB chunks
+    const int maxRetries = 3;       // Max retries per chunk
+    HTTPClient http;
+    WiFiClientSecure client;
 
-  Serial.println("\nDownloading update file...");
-  int httpCode = http.GET();
+    // Configure client
+    client.setInsecure();
+    client.setTimeout(15000);
+    client.setBufferSizes(4096, 1024);
 
-  if (httpCode == HTTP_CODE_OK)
-  {
+    // Get total file size using HEAD request
+    Serial.println("Getting file size...");
+    http.begin(client, updateFileUrl);
+    int httpCode = http.sendRequest("HEAD");
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.printf("Failed to get file size, HTTP code: %d\n", httpCode);
+        http.end();
+        return;
+    }
+    int totalSize = http.getSize();
+    if (totalSize <= 0) {
+        Serial.println("Invalid Content-Length");
+        http.end();
+        return;
+    }
+    http.end();
+    Serial.printf("Total file size: %d bytes\n", totalSize);
+
+    // Check available space in LittleFS
+    FSInfo fs_info;
+    LittleFS.info(fs_info);
+    size_t freeSpace = fs_info.totalBytes - fs_info.usedBytes;
+    if (freeSpace < totalSize) {
+        Serial.printf("Not enough space in file system: needed %d, available %d\n", totalSize, freeSpace);
+        return;
+    }
+
+    // Open file for writing
     File file = LittleFS.open(SPIFFS_FilePath, "w");
     if (!file) {
-      Serial.println("Failed to open file for writing");
-      return;
+        Serial.println("Failed to open file for writing");
+        return;
     }
 
-    http.writeToStream(&file);
+    // Download file in chunks
+    Serial.printf("Free heap before download: %d bytes\n", ESP.getFreeHeap());
+    Serial.println("Downloading update file...");
+    size_t position = 0;
+    while (position < totalSize) {
+        size_t end = position + chunkSize - 1;
+        if (end >= totalSize) end = totalSize - 1;
+        String range = "bytes=" + String(position) + "-" + String(end);
+        size_t expected = end - position + 1;
+
+        bool success = false;
+        for (int retry = 0; retry < maxRetries; retry++) {
+            http.begin(client, updateFileUrl);
+            http.addHeader("Range", range);
+            http.setTimeout(15000);
+            httpCode = http.GET();
+
+            if (httpCode == HTTP_CODE_PARTIAL_CONTENT) {
+                WiFiClient& stream = http.getStream();
+                size_t bytesRead = 0;
+                uint8_t buffer[256]; // Small buffer to manage memory
+                while (bytesRead < expected && stream.connected()) {
+                    size_t available = stream.available();
+                    if (available) {
+                        size_t toRead = min(sizeof(buffer), available);
+                        size_t readNow = stream.readBytes(buffer, toRead);
+                        if (readNow > 0) {
+                            file.seek(position + bytesRead);
+                            size_t written = file.write(buffer, readNow);
+                            if (written != readNow) {
+                                Serial.println("Write error: failed to write to file");
+                                break;
+                            }
+                            bytesRead += written;
+                        }
+                    }
+                    delay(1); // Yield to avoid watchdog timeout
+                }
+                if (bytesRead == expected) {
+                    position += bytesRead;
+                    Serial.printf("Downloaded chunk %d-%d, written %d bytes (%.1f%%)\n",
+                                  position - bytesRead, end, bytesRead, (position * 100.0) / totalSize);
+                    Serial.printf("Free heap after chunk: %d bytes\n", ESP.getFreeHeap());
+                    success = true;
+                    break;
+                } else {
+                    Serial.printf("Incomplete read: expected %d, read %d\n", expected, bytesRead);
+                }
+            } else {
+                Serial.printf("HTTP error: %d for range %s\n", httpCode, range.c_str());
+            }
+            http.end();
+            if (retry < maxRetries - 1) {
+                Serial.printf("Retry %d of %d...\n", retry + 1, maxRetries);
+                delay(1000); // Wait before retry
+            }
+        }
+        if (!success) {
+            Serial.println("Failed to download chunk after retries");
+            file.close();
+            return;
+        }
+    }
     file.close();
-    Serial.println("File downloaded and saved to File System");
-    
-  } else {
-    Serial.printf("Failed to download file, HTTP error code: %d\n", httpCode);
-    Serial.printf("Error message: %s\n", http.errorToString(httpCode).c_str());
-  }
 
-  http.end();
+    // Verify downloaded file size
+    File checkFile = LittleFS.open(SPIFFS_FilePath, "r");
+    if (!checkFile) {
+        Serial.println("Failed to verify downloaded file");
+        return;
+    }
+    size_t downloadedSize = checkFile.size();
+    checkFile.close();
+    if (downloadedSize != totalSize) {
+        Serial.printf("Download size mismatch: expected %d, got %d\n", totalSize, downloadedSize);
+        return;
+    }
+    Serial.println("File downloaded successfully");
 
-  File file = LittleFS.open(SPIFFS_FilePath, "r");
-  if (!file) {
-    Serial.println("Failed to open file for update");
-    return;
-  }
-
-  size_t fileSize = file.size();
-  Serial.printf("Starting OTA update from file: %s, size: %d bytes\n", SPIFFS_FilePath, fileSize);
-
-  if (Update.begin(fileSize)) {
-    size_t written = Update.writeStream(file);
-    if (written == fileSize) {
-      Serial.println("Update successfully written.");
-    } else {
-      Serial.printf("Update failed. Written only %d/%d bytes\n", written, fileSize);
+    // Perform OTA update
+    File updateFile = LittleFS.open(SPIFFS_FilePath, "r");
+    if (!updateFile) {
+        Serial.println("Failed to open file for update");
+        return;
     }
 
-    if (Update.end()) {
-      if (Update.isFinished()) {
-        Serial.println("Update successfully completed. Rebooting...");
-        ESP.restart();
-      } else {
-        Serial.println("Update not finished. Something went wrong.");
-      }
-    } else {
-      Serial.println("Update failed");
-    }
-  } else {
-    Serial.println("Not enough space to begin OTA");
-  }
+    size_t fileSize = updateFile.size();
+    Serial.printf("Starting OTA update from file: %s, size: %d bytes\n", SPIFFS_FilePath, fileSize);
 
-  file.close();
+    if (Update.begin(fileSize)) {
+        size_t written = Update.writeStream(updateFile);
+        if (written == fileSize) {
+            Serial.println("Update successfully written.");
+            if (Update.end()) {
+                if (Update.isFinished()) {
+                    Serial.println("Update successfully completed. Rebooting...");
+                    ESP.restart();
+                } else {
+                    Serial.println("Update not finished. Something went wrong.");
+                }
+            } else {
+                Serial.println("Update failed");
+            }
+        } else {
+            Serial.printf("Update failed. Written only %d/%d bytes\n", written, fileSize);
+        }
+    } else {
+        Serial.println("Not enough space to begin OTA");
+    }
+    updateFile.close();
 }
 #endif
